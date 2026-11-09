@@ -1,0 +1,1287 @@
+diff --git a/README.md b/README.md
+index 3f5f1fd4..a73bdf6b 100644
+--- a/README.md
++++ b/README.md
+@@ -18,6 +18,8 @@ This plugins adds Jenkins pipeline steps to interact with the AWS API.
+ * [cfnDelete](#cfndelete)
+ * [cfnDescribe](#cfndescribe)
+ * [cfnExports](#cfnexports)
++* [cfnCreateChangeSet](#cfncreatechangeset)
++* [cfnExecuteChangeSet](#cfnexecutechangeset)
+ * [snsPublish](#snspublish)
+ * [deployAPI](#deployapi)
+ * [awaitDeploymentCompletion](#awaitdeploymentcompletion)
+@@ -268,6 +270,54 @@ The step returns the global CloudFormation exports as map.
+ def globalExports = cfnExports()
+ ```
+ 
++## cfnCreateChangeSet
++
++Create a change set to update the given CloudFormation stack using the given template from the workspace.
++You can specify an optional list of parameters.
++You can also specify a list of `keepParams` of parameters which will use the previous value on stack updates.
++
++If you have many parameters you can specify a `paramsFile` containing the parameters. The format is either a standard
++JSON file like with the cli or a YAML file for the [cfn-params](https://www.npmjs.com/package/cfn-params) command line utility.
++
++Additionally you can specify a list of tags that are set on the stack and all resources created by CloudFormation.
++The step returns the outputs of the stack as a map.
++
++To prevent running into rate limiting on the AWS API you can change the default polling interval of 1000 ms using the parameter `pollIntervall`. Using the value `0` disables event printing.
++
++```
++cfnCreateChangeSet(stack:'my-stack', changeSet:'my-change-set', file:'template.yaml', params:['InstanceType=t2.nano'], keepParams:['Version'], tags:['TagName=Value'], pollInterval:1000)
++```
++
++Alternatively, you can specify a URL to a template on S3 (you'll need this if you hit the 51200 byte limit on template):
++
++```
++cfnCreateChangeSet(stack:'my-stack', changeSet:'my-change-set', url:'https://s3.amazonaws.com/my-templates-bucket/template.yaml')
++```
++
++By default the `cfnCreateChangeSet` step creates a change set for creating a new stack if the specified stack does not exist, this behaviour can be overridden by passing `create: 'false'` as parameter :
++```
++cfnCreateChangeSet(stack:'my-stack', changeSet:'my-change-set', url:'https://s3.amazonaws.com/my-templates-bucket/template.yaml', create: 'false')
++```
++In above example if `my-stack` already exists, a change set stack with change set will be created, and if it doesnt exist no actions would be performed.
++
++
++In a case where CloudFormation needs to use a different IAM Role for creating or updating the stack than the one currently in effect, you can pass the complete Role ARN to be used as `roleArn` parameter. i.e:
++```
++cfnCreateChangeSet(stack:'my-stack', changeSet:'my-change-set', url:'https://s3.amazonaws.com/my-templates-bucket/template.yaml', roleArn: 'arn:aws:iam::123456789012:role/S3Access')
++```
++
++Note: When creating a change set for a non-existing stack, either `file` or `url` are required. When updating it, omitting both parameters will keep the stack's current template.
++
++## cfnExecuteChangeSet
++
++Execute a previously created change set to create or update a CloudFormation stack. All the necessary information, like parameters and tags, were provided earlier when the change set was created.
++
++To prevent running into rate limiting on the AWS API you can change the default polling interval of 1000 ms using the parameter `pollIntervall`. Using the value `0` disables event printing.
++
++```
++def outputs = cfnExecuteChangeSet(stack:'my-stack', changeSet:'my-change-set', pollInterval:1000)
++```
++
+ ## snsPublish
+ 
+ Publishes a message to SNS.
+@@ -369,6 +419,8 @@ def result = invokeLambda(
+ 
+ ## 1.17 (master)
+ * Add policy for withAWS support - allows an additional policy to be combined with the policy associated with the assumed role. 
++* add `cfnCreateChangeSet` step
++* add `cfnExecuteChangeSet` step
+ 
+ ## 1.16
+ * Add federatedUserId for withAWS support - generates temporary aws credentials for federated user which gets logged in CloudTrail 
+diff --git a/src/main/java/de/taimos/pipeline/aws/cloudformation/AbstractCFNCreateStep.java b/src/main/java/de/taimos/pipeline/aws/cloudformation/AbstractCFNCreateStep.java
+new file mode 100644
+index 0000000..7bab4f9
+--- /dev/null
++++ b/src/main/java/de/taimos/pipeline/aws/cloudformation/AbstractCFNCreateStep.java
+@@ -0,0 +1,316 @@
++/*
++ * -
++ * #%L
++ * Pipeline: AWS Steps
++ * %%
++ * Copyright (C) 2017 Taimos GmbH
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++
++package de.taimos.pipeline.aws.cloudformation;
++
++import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
++import com.amazonaws.services.cloudformation.model.Parameter;
++import com.amazonaws.services.cloudformation.model.Tag;
++import com.google.common.base.Preconditions;
++import de.taimos.pipeline.aws.AWSClientFactory;
++import de.taimos.pipeline.aws.cloudformation.parser.JSONParameterFileParser;
++import de.taimos.pipeline.aws.cloudformation.parser.ParameterFileParser;
++import de.taimos.pipeline.aws.cloudformation.parser.YAMLParameterFileParser;
++import de.taimos.pipeline.aws.utils.IamRoleUtils;
++import hudson.EnvVars;
++import hudson.FilePath;
++import hudson.model.TaskListener;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepImpl;
++import org.kohsuke.stapler.DataBoundSetter;
++
++import javax.annotation.Nonnull;
++import java.util.ArrayList;
++import java.util.Collection;
++
++abstract class AbstractCFNCreateStep extends AbstractStepImpl {
++
++	private final String stack;
++	private String file;
++	private String url;
++	private String[] params;
++	private String[] keepParams;
++	private String[] tags;
++	private String paramsFile;
++	private Long pollInterval = 1000L;
++	private Boolean create = true;
++	private String roleArn;
++
++	public AbstractCFNCreateStep(String stack) {
++		this.stack = stack;
++	}
++	
++	public String getStack() {
++		return this.stack;
++	}
++	
++	public String getFile() {
++		return this.file;
++	}
++	
++	@DataBoundSetter
++	public void setFile(String file) {
++		this.file = file;
++	}
++	
++	public String getUrl() {
++		return this.url;
++	}
++	
++	@DataBoundSetter
++	public void setUrl(String url) {
++		this.url = url;
++	}
++	
++	public String[] getParams() {
++		return this.params != null ? this.params.clone() : null;
++	}
++	
++	@DataBoundSetter
++	public void setParams(String[] params) {
++		this.params = params.clone();
++	}
++	
++	public String[] getKeepParams() {
++		return this.keepParams != null ? this.keepParams.clone() : null;
++	}
++	
++	@DataBoundSetter
++	public void setKeepParams(String[] keepParams) {
++		this.keepParams = keepParams.clone();
++	}
++	
++	public String[] getTags() {
++		return this.tags != null ? this.tags.clone() : null;
++	}
++	
++	@DataBoundSetter
++	public void setTags(String[] tags) {
++		this.tags = tags.clone();
++	}
++	
++	public String getParamsFile() {
++		return this.paramsFile;
++	}
++	
++	@DataBoundSetter
++	public void setParamsFile(String paramsFile) {
++		this.paramsFile = paramsFile;
++	}
++
++	public Long getPollInterval() {
++		return this.pollInterval;
++	}
++	
++	@DataBoundSetter
++	public void setPollInterval(Long pollInterval) {
++		this.pollInterval = pollInterval;
++	}
++	
++	public Boolean getCreate() {
++		return this.create;
++	}
++	
++	@DataBoundSetter
++	public void setCreate(Boolean create) {
++		this.create = create;
++	}
++	
++	public String getRoleArn() {
++		return this.roleArn;
++	}
++	
++	@DataBoundSetter
++	public void setRoleArn(String roleArn) {
++		this.roleArn = roleArn;
++	}
++
++	abstract static class Execution extends AbstractStepExecutionImpl {
++
++		protected abstract AbstractCFNCreateStep getStep();
++		protected abstract EnvVars getEnvVars();
++		protected abstract FilePath getWorkspace();
++		protected abstract TaskListener getListener();
++
++		protected abstract void checkPreconditions();
++		protected abstract String getThreadName();
++		protected abstract Object whenStackExists(Collection<Parameter> parameters, Collection<Tag> tags) throws Exception;
++		protected abstract Object whenStackMissing(Collection<Parameter> parameters, Collection<Tag> tags) throws Exception;
++
++		private String getStack() {
++			return this.getStep().getStack();
++		}
++
++		private String getParamsFile() {
++			return this.getStep().getParamsFile();
++		}
++
++		private String[] getParams() {
++			return this.getStep().getParams();
++		}
++
++		private String[] getKeepParams() {
++			return this.getStep().getKeepParams();
++		}
++
++		private String[] getTags() {
++			return this.getStep().getTags();
++		}
++
++		private String getRoleArn() {
++			return this.getStep().getRoleArn();
++		}
++
++		private Boolean getCreate() {
++			return this.getStep().getCreate();
++		}
++
++		@Override
++		public boolean start() throws Exception {
++
++			final String stack = this.getStack();
++			final String roleArn = this.getRoleArn();
++			final Boolean create = this.getCreate();
++
++			final Collection<Parameter> params = this.parseParamsFile(this.getParamsFile());
++			params.addAll(this.parseParams(this.getParams()));
++
++			final Collection<Parameter> keepParams = this.parseKeepParams(this.getKeepParams());
++			final Collection<Tag> tags = this.parseTags(this.getTags());
++
++			Preconditions.checkArgument(stack != null && !stack.isEmpty(), "Stack must not be null or empty");
++			Preconditions.checkArgument(roleArn == null || IamRoleUtils.validRoleArn(roleArn), "RoleArn must be a valid ARN.");
++
++			this.checkPreconditions();
++
++			new Thread(getThreadName()) {
++				@Override
++				public void run() {
++					try {
++						AmazonCloudFormationClient client = AWSClientFactory.create(AmazonCloudFormationClient.class, Execution.this.getEnvVars());
++						CloudFormationStack cfnStack = new CloudFormationStack(client, stack, Execution.this.getListener());
++						if (cfnStack.exists()) {
++							ArrayList<Parameter> parameters = new ArrayList<>(params);
++							parameters.addAll(keepParams);
++							Execution.this.getContext().onSuccess(Execution.this.whenStackExists(parameters, tags));
++						} else if (create) {
++							Execution.this.getContext().onSuccess(Execution.this.whenStackMissing(params, tags));
++						} else {
++							Execution.this.getListener().getLogger().println("No stack found with the name and skipped creation due to configuration.");
++							Execution.this.getContext().onSuccess(null);
++						}
++					} catch (Exception e) {
++						Execution.this.getContext().onFailure(e);
++					}
++				}
++			}.start();
++			return false;
++		}
++
++		@Override
++		public void stop(@Nonnull Throwable throwable) throws Exception {
++
++		}
++
++		private Collection<Parameter> parseParamsFile(String paramsFile) {
++			try {
++				if (paramsFile == null || paramsFile.isEmpty()) {
++					return new ArrayList<>();
++				}
++				final ParameterFileParser parser;
++				if (paramsFile.endsWith(".json")) {
++					parser = new JSONParameterFileParser();
++				} else if (paramsFile.endsWith(".yaml")) {
++					parser = new YAMLParameterFileParser();
++				} else {
++					throw new RuntimeException("Invalid file extension for parameter file (supports json/yaml)");
++				}
++				return parser.parseParams(this.getWorkspace().child(paramsFile).read());
++			} catch (Exception e) {
++				throw new RuntimeException(e);
++			}
++		}
++
++		private Collection<Tag> parseTags(String[] tags) {
++			Collection<Tag> tagList = new ArrayList<>();
++			if (tags == null) {
++				return tagList;
++			}
++			for (String tag : tags) {
++				int i = tag.indexOf("=");
++				if (i < 0) {
++					throw new RuntimeException("Missing = in tag " + tag);
++				}
++				String key = tag.substring(0, i);
++				String value = tag.substring(i + 1);
++				tagList.add(new Tag().withKey(key).withValue(value));
++			}
++			return tagList;
++		}
++
++		private Collection<Parameter> parseParams(String[] params) {
++			Collection<Parameter> parameters = new ArrayList<>();
++			if (params == null) {
++				return parameters;
++			}
++			for (String param : params) {
++				int i = param.indexOf("=");
++				if (i < 0) {
++					throw new RuntimeException("Missing = in param " + param);
++				}
++				String key = param.substring(0, i);
++				String value = param.substring(i + 1);
++				parameters.add(new Parameter().withParameterKey(key).withParameterValue(value));
++			}
++			return parameters;
++		}
++
++		private Collection<Parameter> parseKeepParams(String[] params) {
++			Collection<Parameter> parameters = new ArrayList<>();
++			if (params == null) {
++				return parameters;
++			}
++			for (String param : params) {
++				parameters.add(new Parameter().withParameterKey(param).withUsePreviousValue(true));
++			}
++			return parameters;
++		}
++
++		protected CloudFormationStack getCfnStack() {
++			AmazonCloudFormationClient client = AWSClientFactory.create(AmazonCloudFormationClient.class, this.getEnvVars());
++			return new CloudFormationStack(client, this.getStack(), this.getListener());
++		}
++
++		protected String readTemplate(String file) {
++			if (file == null) {
++				return null;
++			}
++
++			FilePath child = this.getWorkspace().child(file);
++			try {
++				return child.readToString();
++			} catch (Exception e) {
++				throw new RuntimeException(e);
++			}
++		}
++	}
++
++}
+diff --git a/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNCreateChangeSetStep.java b/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNCreateChangeSetStep.java
+new file mode 100644
+index 0000000..c6ef81c
+--- /dev/null
++++ b/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNCreateChangeSetStep.java
+@@ -0,0 +1,135 @@
++/*
++ * -
++ * #%L
++ * Pipeline: AWS Steps
++ * %%
++ * Copyright (C) 2017 Taimos GmbH
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++
++package de.taimos.pipeline.aws.cloudformation;
++
++import com.amazonaws.services.cloudformation.model.ChangeSetType;
++import com.amazonaws.services.cloudformation.model.Parameter;
++import com.amazonaws.services.cloudformation.model.Tag;
++import com.google.common.base.Preconditions;
++import hudson.EnvVars;
++import hudson.Extension;
++import hudson.FilePath;
++import hudson.model.TaskListener;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepDescriptorImpl;
++import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
++import org.kohsuke.stapler.DataBoundConstructor;
++
++import javax.inject.Inject;
++import java.util.Collection;
++
++public class CFNCreateChangeSetStep extends AbstractCFNCreateStep {
++
++	private final String changeSet;
++
++	@DataBoundConstructor
++	public CFNCreateChangeSetStep(String changeSet, String stack) {
++		super(stack);
++		this.changeSet = changeSet;
++	}
++
++	public String getChangeSet() {
++		return this.changeSet;
++	}
++
++	@Extension
++	public static class DescriptorImpl extends AbstractStepDescriptorImpl {
++		
++		public DescriptorImpl() {
++			super(Execution.class);
++		}
++		
++		@Override
++		public String getFunctionName() {
++			return "cfnCreateChangeSet";
++		}
++		
++		@Override
++		public String getDisplayName() {
++			return "Create CloudFormation change set";
++		}
++	}
++	
++	public static class Execution extends AbstractCFNCreateStep.Execution {
++		
++		@Inject
++		private transient CFNCreateChangeSetStep step;
++		@StepContextParameter
++		private transient EnvVars envVars;
++		@StepContextParameter
++		private transient FilePath workspace;
++		@StepContextParameter
++		private transient TaskListener listener;
++
++		@Override
++		public AbstractCFNCreateStep getStep() {
++			return this.step;
++		}
++
++		@Override
++		public EnvVars getEnvVars() {
++			return this.envVars;
++		}
++
++		@Override
++		public FilePath getWorkspace() {
++			return this.workspace;
++		}
++
++		@Override
++		public TaskListener getListener() {
++			return this.listener;
++		}
++
++		@Override
++		public void checkPreconditions() {
++			final String changeSet = this.step.getChangeSet();
++			Preconditions.checkArgument(changeSet != null && !changeSet.isEmpty(), "Change Set must not be null or empty");
++		}
++
++		@Override
++		public String getThreadName() {
++			return "cfnCreateChangeSet-" + this.step.getChangeSet();
++		}
++
++		@Override
++		public Object whenStackExists(Collection<Parameter> parameters, Collection<Tag> tags) throws Exception {
++			final String changeSet = this.step.getChangeSet();
++			final String file = this.step.getFile();
++			final String url = this.step.getUrl();
++			this.getCfnStack().createChangeSet(changeSet, this.readTemplate(file), url, parameters, tags, this.getStep().getPollInterval(), ChangeSetType.UPDATE, this.getStep().getRoleArn());
++			return null;
++		}
++
++		@Override
++		public Object whenStackMissing(Collection<Parameter> parameters, Collection<Tag> tags) throws Exception {
++			final String changeSet = this.step.getChangeSet();
++			final String file = this.step.getFile();
++			final String url = this.step.getUrl();
++			this.getCfnStack().createChangeSet(changeSet, this.readTemplate(file), url, parameters, tags, this.getStep().getPollInterval(), ChangeSetType.CREATE, this.getStep().getRoleArn());
++			return null;
++		}
++
++		private static final long serialVersionUID = 1L;
++
++	}
++	
++}
+diff --git a/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNExecuteChangeSetStep.java b/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNExecuteChangeSetStep.java
+new file mode 100644
+index 0000000..63929f9
+--- /dev/null
++++ b/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNExecuteChangeSetStep.java
+@@ -0,0 +1,133 @@
++/*
++ * -
++ * #%L
++ * Pipeline: AWS Steps
++ * %%
++ * Copyright (C) 2017 Taimos GmbH
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++
++package de.taimos.pipeline.aws.cloudformation;
++
++import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
++import com.google.common.base.Preconditions;
++import de.taimos.pipeline.aws.AWSClientFactory;
++import hudson.EnvVars;
++import hudson.Extension;
++import hudson.model.TaskListener;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepDescriptorImpl;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepImpl;
++import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
++import org.kohsuke.stapler.DataBoundConstructor;
++import org.kohsuke.stapler.DataBoundSetter;
++
++import javax.annotation.Nonnull;
++import javax.inject.Inject;
++
++public class CFNExecuteChangeSetStep extends AbstractStepImpl {
++
++	private final String changeSet;
++	private final String stack;
++	private Long pollInterval = 1000L;
++
++	@DataBoundConstructor
++	public CFNExecuteChangeSetStep(String changeSet, String stack) {
++		this.changeSet = changeSet;
++		this.stack = stack;
++	}
++
++	public String getChangeSet() {
++		return this.changeSet;
++	}
++
++	public String getStack() {
++		return this.stack;
++	}
++
++	public Long getPollInterval() {
++		return this.pollInterval;
++	}
++	
++	@DataBoundSetter
++	public void setPollInterval(Long pollInterval) {
++		this.pollInterval = pollInterval;
++	}
++	
++	@Extension
++	public static class DescriptorImpl extends AbstractStepDescriptorImpl {
++		
++		public DescriptorImpl() {
++			super(Execution.class);
++		}
++		
++		@Override
++		public String getFunctionName() {
++			return "cfnExecuteChangeSet";
++		}
++		
++		@Override
++		public String getDisplayName() {
++			return "Execute CloudFormation change set";
++		}
++	}
++	
++	public static class Execution extends AbstractStepExecutionImpl {
++		
++		@Inject
++		private transient CFNExecuteChangeSetStep step;
++		@StepContextParameter
++		private transient EnvVars envVars;
++		@StepContextParameter
++		private transient TaskListener listener;
++		
++		@Override
++		public boolean start() throws Exception {
++			final String changeSet = this.step.getChangeSet();
++			final String stack = this.step.getStack();
++
++			Preconditions.checkArgument(changeSet != null && !changeSet.isEmpty(), "Change Set must not be null or empty");
++
++			Preconditions.checkArgument(stack != null && !stack.isEmpty(), "Stack must not be null or empty");
++
++			this.listener.getLogger().format("Executing CloudFormation change set %s %n", changeSet);
++			
++			new Thread("cfnExecuteChangeSet-" + changeSet) {
++				@Override
++				public void run() {
++					try {
++						AmazonCloudFormationClient client = AWSClientFactory.create(AmazonCloudFormationClient.class, Execution.this.envVars);
++						CloudFormationStack cfnStack = new CloudFormationStack(client, stack, Execution.this.listener);
++						cfnStack.executeChangeSet(changeSet, Execution.this.step.getPollInterval());
++						Execution.this.listener.getLogger().println("Execute change set complete");
++						Execution.this.getContext().onSuccess(cfnStack.describeOutputs());
++					} catch (Exception e) {
++						Execution.this.getContext().onFailure(e);
++					}
++				}
++			}.start();
++			return false;
++		}
++		
++		@Override
++		public void stop(@Nonnull Throwable cause) throws Exception {
++			//
++		}
++		
++		private static final long serialVersionUID = 1L;
++		
++	}
++	
++}
+diff --git a/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNUpdateStep.java b/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNUpdateStep.java
+index 1b511f1..39976ad 100644
+--- a/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNUpdateStep.java
++++ b/src/main/java/de/taimos/pipeline/aws/cloudformation/CFNUpdateStep.java
+@@ -21,112 +21,29 @@
+ 
+ package de.taimos.pipeline.aws.cloudformation;
+ 
+-import java.util.ArrayList;
+-import java.util.Collection;
+-
+-import javax.annotation.Nonnull;
+-import javax.inject.Inject;
+-
+-import org.jenkinsci.plugins.workflow.steps.AbstractStepDescriptorImpl;
+-import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
+-import org.jenkinsci.plugins.workflow.steps.AbstractStepImpl;
+-import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
+-import org.kohsuke.stapler.DataBoundConstructor;
+-import org.kohsuke.stapler.DataBoundSetter;
+-
+-import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
+ import com.amazonaws.services.cloudformation.model.Parameter;
+ import com.amazonaws.services.cloudformation.model.Tag;
+-import com.google.common.base.Preconditions;
+-
+-import de.taimos.pipeline.aws.AWSClientFactory;
+-import de.taimos.pipeline.aws.cloudformation.parser.JSONParameterFileParser;
+-import de.taimos.pipeline.aws.cloudformation.parser.ParameterFileParser;
+-import de.taimos.pipeline.aws.cloudformation.parser.YAMLParameterFileParser;
+-import de.taimos.pipeline.aws.utils.IamRoleUtils;
+ import hudson.EnvVars;
+ import hudson.Extension;
+ import hudson.FilePath;
+ import hudson.model.TaskListener;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepDescriptorImpl;
++import org.jenkinsci.plugins.workflow.steps.StepContextParameter;
++import org.kohsuke.stapler.DataBoundConstructor;
++import org.kohsuke.stapler.DataBoundSetter;
++
++import javax.inject.Inject;
++import java.util.Collection;
+ 
+-public class CFNUpdateStep extends AbstractStepImpl {
++public class CFNUpdateStep extends AbstractCFNCreateStep {
+ 	
+-	private final String stack;
+-	private String file;
+-	private String url;
+-	private String[] params;
+-	private String[] keepParams;
+-	private String[] tags;
+-	private String paramsFile;
+ 	private Integer timeoutInMinutes;
+-	private Long pollInterval = 1000L;
+-	private Boolean create = true;
+-	
+-	private String roleArn;
+-	
++
+ 	@DataBoundConstructor
+ 	public CFNUpdateStep(String stack) {
+-		this.stack = stack;
+-	}
+-	
+-	public String getStack() {
+-		return this.stack;
+-	}
+-	
+-	public String getFile() {
+-		return this.file;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setFile(String file) {
+-		this.file = file;
+-	}
+-	
+-	public String getUrl() {
+-		return this.url;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setUrl(String url) {
+-		this.url = url;
+-	}
+-	
+-	public String[] getParams() {
+-		return this.params != null ? this.params.clone() : null;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setParams(String[] params) {
+-		this.params = params.clone();
+-	}
+-	
+-	public String[] getKeepParams() {
+-		return this.keepParams != null ? this.keepParams.clone() : null;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setKeepParams(String[] keepParams) {
+-		this.keepParams = keepParams.clone();
+-	}
+-	
+-	public String[] getTags() {
+-		return this.tags != null ? this.tags.clone() : null;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setTags(String[] tags) {
+-		this.tags = tags.clone();
+-	}
+-	
+-	public String getParamsFile() {
+-		return this.paramsFile;
++		super(stack);
+ 	}
+-	
+-	@DataBoundSetter
+-	public void setParamsFile(String paramsFile) {
+-		this.paramsFile = paramsFile;
+-	}
+-	
++
+ 	public Integer getTimeoutInMinutes() {
+ 		return this.timeoutInMinutes;
+ 	}
+@@ -135,34 +52,7 @@ public class CFNUpdateStep extends AbstractStepImpl {
+ 	public void setTimeoutInMinutes(Integer timeoutInMinutes) {
+ 		this.timeoutInMinutes = timeoutInMinutes;
+ 	}
+-	
+-	public Long getPollInterval() {
+-		return this.pollInterval;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setPollInterval(Long pollInterval) {
+-		this.pollInterval = pollInterval;
+-	}
+-	
+-	public Boolean getCreate() {
+-		return create;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setCreate(Boolean create) {
+-		this.create = create;
+-	}
+-	
+-	public String getRoleArn() {
+-		return roleArn;
+-	}
+-	
+-	@DataBoundSetter
+-	public void setRoleArn(String roleArn) {
+-		this.roleArn = roleArn;
+-	}
+-	
++
+ 	@Extension
+ 	public static class DescriptorImpl extends AbstractStepDescriptorImpl {
+ 		
+@@ -180,8 +70,8 @@ public class CFNUpdateStep extends AbstractStepImpl {
+ 			return "Create or Update CloudFormation stack";
+ 		}
+ 	}
+-	
+-	public static class Execution extends AbstractStepExecutionImpl {
++
++	public static class Execution extends AbstractCFNCreateStep.Execution {
+ 		
+ 		@Inject
+ 		private transient CFNUpdateStep step;
+@@ -191,135 +81,55 @@ public class CFNUpdateStep extends AbstractStepImpl {
+ 		private transient FilePath workspace;
+ 		@StepContextParameter
+ 		private transient TaskListener listener;
+-		
++
+ 		@Override
+-		public boolean start() throws Exception {
+-			final String stack = this.step.getStack();
+-			final String file = this.step.getFile();
+-			final String url = this.step.getUrl();
+-			final String roleArn = this.step.getRoleArn();
+-			final Boolean create = this.step.getCreate();
+-			
+-			final Collection<Parameter> params = this.parseParamsFile(this.step.getParamsFile());
+-			params.addAll(this.parseParams(this.step.getParams()));
+-			
+-			final Collection<Parameter> keepParams = this.parseKeepParams(this.step.getKeepParams());
+-			final Collection<Tag> tags = this.parseTags(this.step.getTags());
+-			final Integer timeoutInMinutes = this.step.getTimeoutInMinutes();
+-			
+-			Preconditions.checkArgument(stack != null && !stack.isEmpty(), "Stack must not be null or empty");
+-			Preconditions.checkArgument(roleArn == null || IamRoleUtils.validRoleArn(roleArn), "RoleArn must be a valid ARN.");
+-			this.listener.getLogger().format("Updating/Creating CloudFormation stack %s %n", stack);
+-			
+-			new Thread("cfnUpdate-" + stack) {
+-				@Override
+-				public void run() {
+-					try {
+-						AmazonCloudFormationClient client = AWSClientFactory.create(AmazonCloudFormationClient.class, Execution.this.envVars);
+-						CloudFormationStack cfnStack = new CloudFormationStack(client, stack, Execution.this.listener);
+-						if (cfnStack.exists()) {
+-							ArrayList<Parameter> parameters = new ArrayList<>(params);
+-							parameters.addAll(keepParams);
+-							cfnStack.update(Execution.this.readTemplate(file), url, parameters, tags, Execution.this.step.getPollInterval(), roleArn);
+-						} else if (create) {
+-							cfnStack.create(Execution.this.readTemplate(file), url, params, tags, timeoutInMinutes, Execution.this.step.getPollInterval(), roleArn);
+-						} else {
+-							Execution.this.listener.getLogger().println("No stack found with the name and skipped creation due to configuration.");
+-						}
+-						Execution.this.listener.getLogger().println("Stack update complete");
+-						Execution.this.getContext().onSuccess(cfnStack.describeOutputs());
+-					} catch (Exception e) {
+-						Execution.this.getContext().onFailure(e);
+-					}
+-				}
+-			}.start();
+-			return false;
++		public AbstractCFNCreateStep getStep() {
++			return this.step;
+ 		}
+-		
+-		private Collection<Parameter> parseParamsFile(String paramsFile) {
+-			try {
+-				if (paramsFile == null || paramsFile.isEmpty()) {
+-					return new ArrayList<>();
+-				}
+-				final ParameterFileParser parser;
+-				if (paramsFile.endsWith(".json")) {
+-					parser = new JSONParameterFileParser();
+-				} else if (paramsFile.endsWith(".yaml")) {
+-					parser = new YAMLParameterFileParser();
+-				} else {
+-					throw new RuntimeException("Invalid file extension for parameter file (supports json/yaml)");
+-				}
+-				return parser.parseParams(this.workspace.child(paramsFile).read());
+-			} catch (Exception e) {
+-				throw new RuntimeException(e);
+-			}
++
++		@Override
++		public EnvVars getEnvVars() {
++			return this.envVars;
+ 		}
+-		
+-		private String readTemplate(String file) {
+-			if (file == null) {
+-				return null;
+-			}
+-			
+-			FilePath child = this.workspace.child(file);
+-			try {
+-				return child.readToString();
+-			} catch (Exception e) {
+-				throw new RuntimeException(e);
+-			}
++
++		@Override
++		public FilePath getWorkspace() {
++			return this.workspace;
+ 		}
+-		
+-		private Collection<Tag> parseTags(String[] tags) {
+-			Collection<Tag> tagList = new ArrayList<>();
+-			if (tags == null) {
+-				return tagList;
+-			}
+-			for (String tag : tags) {
+-				int i = tag.indexOf("=");
+-				if (i < 0) {
+-					throw new RuntimeException("Missing = in tag " + tag);
+-				}
+-				String key = tag.substring(0, i);
+-				String value = tag.substring(i + 1);
+-				tagList.add(new Tag().withKey(key).withValue(value));
+-			}
+-			return tagList;
++
++		@Override
++		public TaskListener getListener() {
++			return this.listener;
+ 		}
+-		
+-		private Collection<Parameter> parseParams(String[] params) {
+-			Collection<Parameter> parameters = new ArrayList<>();
+-			if (params == null) {
+-				return parameters;
+-			}
+-			for (String param : params) {
+-				int i = param.indexOf("=");
+-				if (i < 0) {
+-					throw new RuntimeException("Missing = in param " + param);
+-				}
+-				String key = param.substring(0, i);
+-				String value = param.substring(i + 1);
+-				parameters.add(new Parameter().withParameterKey(key).withParameterValue(value));
+-			}
+-			return parameters;
++
++		@Override
++		public void checkPreconditions() {}
++
++		@Override
++		public String getThreadName() {
++			return "cfnUpdate-" + this.step.getStack();
+ 		}
+-		
+-		private Collection<Parameter> parseKeepParams(String[] params) {
+-			Collection<Parameter> parameters = new ArrayList<>();
+-			if (params == null) {
+-				return parameters;
+-			}
+-			for (String param : params) {
+-				parameters.add(new Parameter().withParameterKey(param).withUsePreviousValue(true));
+-			}
+-			return parameters;
++
++		@Override
++		public Object whenStackExists(Collection<Parameter> parameters, Collection<Tag> tags) throws Exception {
++			final String file = this.getStep().getFile();
++			final String url = this.getStep().getUrl();
++			CloudFormationStack cfnStack = this.getCfnStack();
++			cfnStack.update(this.readTemplate(file), url, parameters, tags, this.getStep().getPollInterval(), this.getStep().getRoleArn());
++			return cfnStack.describeOutputs();
+ 		}
+-		
++
+ 		@Override
+-		public void stop(@Nonnull Throwable cause) throws Exception {
+-			//
++		public Object whenStackMissing(Collection<Parameter> parameters, Collection<Tag> tags) throws Exception {
++			final String file = this.getStep().getFile();
++			final String url = this.getStep().getUrl();
++			CloudFormationStack cfnStack = this.getCfnStack();
++			cfnStack.create(this.readTemplate(file), url, parameters, tags, this.step.getTimeoutInMinutes(), this.getStep().getPollInterval(), this.getStep().getRoleArn());
++			return cfnStack.describeOutputs();
+ 		}
+-		
++
+ 		private static final long serialVersionUID = 1L;
+-		
++
+ 	}
+ 	
+ }
+diff --git a/src/main/java/de/taimos/pipeline/aws/cloudformation/CloudFormationStack.java b/src/main/java/de/taimos/pipeline/aws/cloudformation/CloudFormationStack.java
+index 6c82ebd..8c74694 100644
+--- a/src/main/java/de/taimos/pipeline/aws/cloudformation/CloudFormationStack.java
++++ b/src/main/java/de/taimos/pipeline/aws/cloudformation/CloudFormationStack.java
+@@ -21,26 +21,31 @@
+ 
+ package de.taimos.pipeline.aws.cloudformation;
+ 
+-import java.util.Collection;
+-import java.util.HashMap;
+-import java.util.Map;
+-import java.util.concurrent.ExecutionException;
+-
+ import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
+ import com.amazonaws.services.cloudformation.model.AmazonCloudFormationException;
+ import com.amazonaws.services.cloudformation.model.Capability;
++import com.amazonaws.services.cloudformation.model.ChangeSetType;
++import com.amazonaws.services.cloudformation.model.CreateChangeSetRequest;
+ import com.amazonaws.services.cloudformation.model.CreateStackRequest;
++import com.amazonaws.services.cloudformation.model.DeleteChangeSetRequest;
+ import com.amazonaws.services.cloudformation.model.DeleteStackRequest;
++import com.amazonaws.services.cloudformation.model.DescribeChangeSetRequest;
++import com.amazonaws.services.cloudformation.model.DescribeChangeSetResult;
+ import com.amazonaws.services.cloudformation.model.DescribeStacksRequest;
+ import com.amazonaws.services.cloudformation.model.DescribeStacksResult;
++import com.amazonaws.services.cloudformation.model.ExecuteChangeSetRequest;
+ import com.amazonaws.services.cloudformation.model.Output;
+ import com.amazonaws.services.cloudformation.model.Parameter;
+ import com.amazonaws.services.cloudformation.model.Stack;
+ import com.amazonaws.services.cloudformation.model.Tag;
+ import com.amazonaws.services.cloudformation.model.UpdateStackRequest;
+-
+ import hudson.model.TaskListener;
+ 
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.ExecutionException;
++
+ public class CloudFormationStack {
+ 	
+ 	private final AmazonCloudFormationClient client;
+@@ -65,7 +70,25 @@ public class CloudFormationStack {
+ 			return false;
+ 		}
+ 	}
+-	
++
++	public boolean changeSetExists(String changeSetName) {
++		try {
++			this.client.describeChangeSet(new DescribeChangeSetRequest().withStackName(this.stack).withChangeSetName(changeSetName));
++			return true;
++		} catch (AmazonCloudFormationException e) {
++			if ("AccessDenied".equals(e.getErrorCode())) {
++				this.listener.getLogger().format("Got error from describeStacks: %s %n", e.getErrorMessage());
++				throw e;
++			}
++			return false;
++		}
++	}
++
++	public boolean changeSetHasChanges(String changeSetName) {
++		DescribeChangeSetResult result = this.client.describeChangeSet(new DescribeChangeSetRequest().withStackName(this.stack).withChangeSetName(changeSetName));
++		return !result.getChanges().isEmpty();
++	}
++
+ 	public Map<String, String> describeOutputs() {
+ 		DescribeStacksResult result = this.client.describeStacks(new DescribeStacksRequest().withStackName(this.stack));
+ 		Stack cfnStack = result.getStacks().get(0);
+@@ -107,14 +130,87 @@ public class CloudFormationStack {
+ 			this.client.updateStack(req);
+ 			
+ 			new EventPrinter(this.client, this.listener).waitAndPrintStackEvents(this.stack, this.client.waiters().stackUpdateComplete(), pollIntervallMillis);
++
++			this.listener.getLogger().format("Updated CloudFormation stack %s %n", stack);
++
+ 		} catch (AmazonCloudFormationException e) {
+ 			if (e.getMessage().contains("No updates are to be performed")) {
++				this.listener.getLogger().format("No updates were needed for CloudFormation stack %s %n", stack);
+ 				return;
+ 			}
++			this.listener.getLogger().format("Failed to update CloudFormation stack %s %n", stack);
+ 			throw e;
+ 		}
+ 	}
+-	
++
++	public void createChangeSet(String changeSetName, String templateBody, String templateUrl, Collection<Parameter> params, Collection<Tag> tags, long pollIntervallMillis, ChangeSetType changeSetType, String roleArn) throws ExecutionException {
++		try {
++			CreateChangeSetRequest req = new CreateChangeSetRequest();
++			req.withChangeSetName(changeSetName).withStackName(this.stack).withCapabilities(Capability.CAPABILITY_IAM, Capability.CAPABILITY_NAMED_IAM).withChangeSetType(changeSetType);
++
++			if (ChangeSetType.CREATE.equals(changeSetType)) {
++				this.listener.getLogger().format("Creating CloudFormation change set %s for new stack %s %n", changeSetName, stack);
++				if ((templateBody == null || templateBody.isEmpty()) && (templateUrl == null || templateUrl.isEmpty())) {
++					throw new IllegalArgumentException("Either a file or url for the template must be specified");
++				}
++				req.withTemplateBody(templateBody).withTemplateURL(templateUrl);
++			} else if (ChangeSetType.UPDATE.equals(changeSetType)) {
++				this.listener.getLogger().format("Creating CloudFormation change set %s for existing stack %s %n", changeSetName, stack);
++				if (templateBody != null && !templateBody.isEmpty()) {
++					req.setTemplateBody(templateBody);
++				} else if (templateUrl != null && !templateUrl.isEmpty()) {
++					req.setTemplateURL(templateUrl);
++				} else {
++					req.setUsePreviousTemplate(true);
++				}
++			} else {
++				throw new IllegalArgumentException("Cannot create a CloudFormation change set without a valid change set type.");
++			}
++
++			req.withParameters(params).withTags(tags).withRoleARN(roleArn);
++
++			this.client.createChangeSet(req);
++
++			new EventPrinter(this.client, this.listener).waitAndPrintChangeSetEvents(this.stack, changeSetName, this.client.waiters().changeSetCreateComplete(), pollIntervallMillis);
++
++			this.listener.getLogger().format("Created CloudFormation change set %s for stack %s %n", changeSetName, stack);
++
++		} catch (ExecutionException e) {
++			try {
++				if (changeSetExists(changeSetName) && !changeSetHasChanges(changeSetName)) {
++					// Ignore the failed creation of a change set with no changes.
++					this.listener.getLogger().format("Created empty change set %s for stack %s %n", changeSetName, this.stack);
++					return;
++				}
++			} catch (Throwable throwable) {
++				e.addSuppressed(throwable);
++			}
++			this.listener.getLogger().format("Failed to create CloudFormation change set %s for stack %s %n", changeSetName, stack);
++			throw e;
++		}
++	}
++
++	public void executeChangeSet(String changeSetName, long pollIntervallMillis) throws ExecutionException {
++		if (!changeSetHasChanges(changeSetName)) {
++			// If the change set has no changes we should simply delete it.
++			this.listener.getLogger().format("Deleting empty change set %s for stack %s %n", changeSetName, this.stack);
++			DeleteChangeSetRequest req = new DeleteChangeSetRequest().withChangeSetName(changeSetName).withStackName(this.stack);
++			this.client.deleteChangeSet(req);
++		} else {
++			this.listener.getLogger().format("Executing change set %s for stack %s %n", changeSetName, this.stack);
++			ExecuteChangeSetRequest req = new ExecuteChangeSetRequest().withChangeSetName(changeSetName).withStackName(this.stack);
++			this.client.executeChangeSet(req);
++			DescribeChangeSetResult describeResult = this.client.describeChangeSet(new DescribeChangeSetRequest().withChangeSetName(changeSetName).withStackName(this.stack));
++			String changeSetType = describeResult.getChangeSetType();
++			if (ChangeSetType.CREATE.toString().equals(changeSetType)) {
++				new EventPrinter(this.client, this.listener).waitAndPrintStackEvents(this.stack, this.client.waiters().stackCreateComplete(), pollIntervallMillis);
++			} else {
++				new EventPrinter(this.client, this.listener).waitAndPrintStackEvents(this.stack, this.client.waiters().stackUpdateComplete(), pollIntervallMillis);
++			}
++			this.listener.getLogger().format("Executed change set %s for stack %s %n", changeSetName, this.stack);
++		}
++	}
++
+ 	public void delete(long pollIntervallMillis) throws ExecutionException {
+ 		this.client.deleteStack(new DeleteStackRequest().withStackName(this.stack));
+ 		new EventPrinter(this.client, this.listener).waitAndPrintStackEvents(this.stack, this.client.waiters().stackDeleteComplete(), pollIntervallMillis);
+diff --git a/src/main/java/de/taimos/pipeline/aws/cloudformation/EventPrinter.java b/src/main/java/de/taimos/pipeline/aws/cloudformation/EventPrinter.java
+index ca6a22f..8314b84 100644
+--- a/src/main/java/de/taimos/pipeline/aws/cloudformation/EventPrinter.java
++++ b/src/main/java/de/taimos/pipeline/aws/cloudformation/EventPrinter.java
+@@ -28,16 +28,17 @@ import java.util.Date;
+ import java.util.List;
+ import java.util.concurrent.ExecutionException;
+ 
+-import org.apache.commons.lang.StringUtils;
+-import org.apache.http.concurrent.BasicFuture;
+-
+-import com.amazonaws.AmazonWebServiceRequest;
+-import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
+ import com.amazonaws.services.cloudformation.model.AmazonCloudFormationException;
++import com.amazonaws.services.cloudformation.model.DescribeChangeSetRequest;
+ import com.amazonaws.services.cloudformation.model.DescribeStackEventsRequest;
+ import com.amazonaws.services.cloudformation.model.DescribeStackEventsResult;
+ import com.amazonaws.services.cloudformation.model.DescribeStacksRequest;
+ import com.amazonaws.services.cloudformation.model.StackEvent;
++import org.apache.commons.lang.StringUtils;
++import org.apache.http.concurrent.BasicFuture;
++
++import com.amazonaws.AmazonWebServiceRequest;
++import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
+ import com.amazonaws.waiters.Waiter;
+ import com.amazonaws.waiters.WaiterHandler;
+ import com.amazonaws.waiters.WaiterParameters;
+@@ -53,10 +54,28 @@ public class EventPrinter {
+ 		this.client = client;
+ 		this.listener = listener;
+ 	}
+-	
++
++	public void waitAndPrintChangeSetEvents(String stack, String changeSet, Waiter<DescribeChangeSetRequest> waiter, long pollIntervalMillis) throws ExecutionException {
++
++		final BasicFuture<AmazonWebServiceRequest> waitResult = new BasicFuture<>(null);
++
++		waiter.runAsync(new WaiterParameters<>(new DescribeChangeSetRequest().withStackName(stack).withChangeSetName(changeSet)), new WaiterHandler() {
++			@Override
++			public void onWaitSuccess(AmazonWebServiceRequest request) {
++				waitResult.completed(request);
++			}
++
++			@Override
++			public void onWaitFailure(Exception e) {
++				waitResult.failed(e);
++			}
++		});
++
++		waitAndPrintEvents(stack, pollIntervalMillis, waitResult);
++	}
++
+ 	public void waitAndPrintStackEvents(String stack, Waiter<DescribeStacksRequest> waiter, long pollIntervalMillis) throws ExecutionException {
+-		Date startDate = new Date();
+-		
++
+ 		final BasicFuture<AmazonWebServiceRequest> waitResult = new BasicFuture<>(null);
+ 		
+ 		waiter.runAsync(new WaiterParameters<>(new DescribeStacksRequest().withStackName(stack)), new WaiterHandler() {
+@@ -70,14 +89,20 @@ public class EventPrinter {
+ 				waitResult.failed(e);
+ 			}
+ 		});
+-		
++
++		waitAndPrintEvents(stack, pollIntervalMillis, waitResult);
++	}
++
++	private void waitAndPrintEvents(String stack, long pollIntervalMillis, BasicFuture<AmazonWebServiceRequest> waitResult) throws ExecutionException {
++		Date startDate = new Date();
++
+ 		String lastEventId = null;
+ 		this.printLine();
+ 		this.printStackName(stack);
+ 		this.printLine();
+-		
++
+ 		SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+-		
++
+ 		if (pollIntervalMillis > 0) {
+ 			while (!waitResult.isDone()) {
+ 				try {
+@@ -107,14 +132,14 @@ public class EventPrinter {
+ 				}
+ 			}
+ 		}
+-		
++
+ 		try {
+ 			waitResult.get();
+ 		} catch (InterruptedException e) {
+ 			this.listener.getLogger().format("Failed to wait for CFN action to complete: %s", e.getMessage());
+ 		}
+ 	}
+-	
++
+ 	private void printEvent(SimpleDateFormat sdf, StackEvent event) {
+ 		String time = this.padRight(sdf.format(event.getTimestamp()), 25);
+ 		String logicalResourceId = this.padRight(event.getLogicalResourceId(), 20);

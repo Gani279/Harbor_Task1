@@ -1,0 +1,56 @@
+{
+  "schema_version": "compact-swebench-harborized-v1",
+  "execution": {
+    "commands": [
+      "rm -rf target/surefire-reports; mvn -B -o -Dmaven.javadoc.skip=true -Dmaven.test.failure.ignore=true -Dtest=ChangeSetStepsTest test; python3 - <<'PYEOF'\nimport glob, xml.etree.ElementTree as ET\nfor f in sorted(glob.glob('target/surefire-reports/TEST-*ChangeSetStepsTest.xml')):\n    root = ET.parse(f).getroot()\n    for tc in root.iter('testcase'):\n        failed = any(c.tag in ('failure', 'error') for c in tc)\n        print(('SUREFIRE_FAIL ' if failed else 'SUREFIRE_PASS ') + tc.get('classname') + '::' + tc.get('name'))\nPYEOF"
+    ],
+    "selected_test_files_to_run": [
+      "src/test/java/de/taimos/pipeline/aws/cloudformation/ChangeSetStepsTest.java"
+    ],
+    "env": {},
+    "timeout_sec": 1800
+  },
+  "grading": {
+    "fail_to_pass": [
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetStepExposesChangeSetAndStack",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetStepDefaultsAndSetters",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetStepEnablesStackCreationByDefault",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetStepExposesChangeSetAndStack",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetStepPollIntervalDefaultAndSetter",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetDeletesEmptyChangeSet",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetRequiresTemplateForNewStack",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetDescriptorMetadata",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetDescriptorMetadata",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetExecutesWhenChangesExist",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetForNewStackSendsSuppliedTemplate",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetForExistingStackReusesPreviousTemplateWhenOmitted",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetWithZeroPollIntervalDoesNotPollForEvents",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::cfnUpdateStepKeepsItsPublicDefaultsAfterSharingTheAbstractBase",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::parameterFileValidationRejectsUnsupportedExtensionBeforeAnyAwsCall",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::parameterFileValidationAcceptsJsonAndYamlExtensionsWithoutThrowing",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetExecutionDispatchesExistingStackUpdate",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::createChangeSetExecutionDispatchesMissingStackCreate",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::executeChangeSetExecutionValidatesItsPublicInputs"
+    ],
+    "pass_to_pass": [
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::existingStackIsDetected",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::missingStackIsNotDetected",
+      "de.taimos.pipeline.aws.cloudformation.ChangeSetStepsTest::describeOutputsReturnsStackOutputs"
+    ],
+    "required_pass": [],
+    "allow_extra_failures": false,
+    "parser": {
+      "framework": "custom",
+      "result_source": "stdout_stderr",
+      "pass_regex": "^SUREFIRE_PASS (?P<name>\\S+)",
+      "fail_regex": "^SUREFIRE_FAIL (?P<name>\\S+)"
+    }
+  },
+  "artifacts": {
+    "stdout_log": "/logs/verifier/test-stdout.txt",
+    "stderr_log": "/logs/verifier/test-stderr.txt",
+    "parsed_results": "/logs/verifier/output.json",
+    "report": "/logs/verifier/report.json",
+    "reward": "/logs/verifier/reward.txt"
+  }
+}

@@ -1,0 +1,481 @@
+diff --git a/src/test/java/de/taimos/pipeline/aws/cloudformation/ChangeSetStepsTest.java b/src/test/java/de/taimos/pipeline/aws/cloudformation/ChangeSetStepsTest.java
+new file mode 100644
+index 0000000..ee37a1b
+--- /dev/null
++++ b/src/test/java/de/taimos/pipeline/aws/cloudformation/ChangeSetStepsTest.java
+@@ -0,0 +1,475 @@
++/*
++ * -
++ * #%L
++ * Pipeline: AWS Steps
++ * %%
++ * Copyright (C) 2017 Taimos GmbH
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++
++package de.taimos.pipeline.aws.cloudformation;
++
++import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
++import com.amazonaws.services.cloudformation.model.AmazonCloudFormationException;
++import com.amazonaws.services.cloudformation.model.Change;
++import com.amazonaws.services.cloudformation.model.ChangeSetType;
++import com.amazonaws.services.cloudformation.model.CreateChangeSetRequest;
++import com.amazonaws.services.cloudformation.model.CreateChangeSetResult;
++import com.amazonaws.services.cloudformation.model.DeleteChangeSetRequest;
++import com.amazonaws.services.cloudformation.model.DeleteChangeSetResult;
++import com.amazonaws.services.cloudformation.model.DescribeChangeSetRequest;
++import com.amazonaws.services.cloudformation.model.DescribeChangeSetResult;
++import com.amazonaws.services.cloudformation.model.DescribeStackEventsRequest;
++import com.amazonaws.services.cloudformation.model.DescribeStackEventsResult;
++import com.amazonaws.services.cloudformation.model.DescribeStacksRequest;
++import com.amazonaws.services.cloudformation.model.DescribeStacksResult;
++import com.amazonaws.services.cloudformation.model.ExecuteChangeSetRequest;
++import com.amazonaws.services.cloudformation.model.ExecuteChangeSetResult;
++import com.amazonaws.services.cloudformation.model.Output;
++import com.amazonaws.services.cloudformation.model.Parameter;
++import com.amazonaws.services.cloudformation.model.Stack;
++import com.amazonaws.services.cloudformation.model.StackEvent;
++import com.amazonaws.services.cloudformation.model.Tag;
++import hudson.FilePath;
++import hudson.model.TaskListener;
++import org.junit.Assert;
++import org.junit.Test;
++
++import java.io.File;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Map;
++
++/**
++ * Unit tests covering the change set support introduced for the
++ * {@code cfnCreateChangeSet} and {@code cfnExecuteChangeSet} pipeline steps.
++ */
++public class ChangeSetStepsTest {
++
++	@Test
++	public void createChangeSetStepExposesChangeSetAndStack() {
++		CFNCreateChangeSetStep step = new CFNCreateChangeSetStep("my-change-set", "my-stack");
++		Assert.assertEquals("my-change-set", step.getChangeSet());
++		Assert.assertEquals("my-stack", step.getStack());
++	}
++
++	@Test
++	public void createChangeSetStepDefaultsAndSetters() {
++		CFNCreateChangeSetStep step = new CFNCreateChangeSetStep("cs", "stack");
++
++		Assert.assertEquals(Long.valueOf(1000L), step.getPollInterval());
++		Assert.assertEquals(Boolean.TRUE, step.getCreate());
++		Assert.assertNull(step.getFile());
++		Assert.assertNull(step.getUrl());
++		Assert.assertNull(step.getRoleArn());
++
++		step.setFile("template.yaml");
++		step.setUrl("https://s3.amazonaws.com/bucket/template.yaml");
++		step.setParams(new String[]{"InstanceType=t2.nano"});
++		step.setKeepParams(new String[]{"Version"});
++		step.setTags(new String[]{"TagName=Value"});
++		step.setParamsFile("params.json");
++		step.setPollInterval(2000L);
++		step.setCreate(false);
++		step.setRoleArn("arn:aws:iam::123456789012:role/S3Access");
++
++		Assert.assertEquals("template.yaml", step.getFile());
++		Assert.assertEquals("https://s3.amazonaws.com/bucket/template.yaml", step.getUrl());
++		Assert.assertArrayEquals(new String[]{"InstanceType=t2.nano"}, step.getParams());
++		Assert.assertArrayEquals(new String[]{"Version"}, step.getKeepParams());
++		Assert.assertArrayEquals(new String[]{"TagName=Value"}, step.getTags());
++		Assert.assertEquals("params.json", step.getParamsFile());
++		Assert.assertEquals(Long.valueOf(2000L), step.getPollInterval());
++		Assert.assertEquals(Boolean.FALSE, step.getCreate());
++		Assert.assertEquals("arn:aws:iam::123456789012:role/S3Access", step.getRoleArn());
++	}
++
++	@Test
++	public void createChangeSetStepEnablesStackCreationByDefault() {
++		CFNCreateChangeSetStep step = new CFNCreateChangeSetStep("cs", "stack");
++		Assert.assertTrue(step.getCreate());
++	}
++
++	@Test
++	public void executeChangeSetStepExposesChangeSetAndStack() {
++		CFNExecuteChangeSetStep step = new CFNExecuteChangeSetStep("my-change-set", "my-stack");
++		Assert.assertEquals("my-change-set", step.getChangeSet());
++		Assert.assertEquals("my-stack", step.getStack());
++	}
++
++	@Test
++	public void executeChangeSetStepPollIntervalDefaultAndSetter() {
++		CFNExecuteChangeSetStep step = new CFNExecuteChangeSetStep("cs", "stack");
++		Assert.assertEquals(Long.valueOf(1000L), step.getPollInterval());
++
++		step.setPollInterval(5000L);
++		Assert.assertEquals(Long.valueOf(5000L), step.getPollInterval());
++	}
++
++	@Test
++	public void executeChangeSetDeletesEmptyChangeSet() throws Exception {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		stack.executeChangeSet("empty-change-set", 0L);
++
++		Assert.assertEquals("empty change set must be deleted", 1, client.deleteCalls);
++		Assert.assertEquals("empty change set must not be executed", 0, client.executeCalls);
++	}
++
++	@Test
++	public void createChangeSetRequiresTemplateForNewStack() {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		Collection<Parameter> params = Collections.emptyList();
++		Collection<Tag> tags = Collections.emptyList();
++		try {
++			stack.createChangeSet("cs", null, null, params, tags, 0L, ChangeSetType.CREATE, null);
++			Assert.fail("creating a change set for a new stack without file or url must fail");
++		} catch (IllegalArgumentException expected) {
++			// expected
++		} catch (Exception e) {
++			throw new AssertionError("unexpected exception type: " + e, e);
++		}
++		Assert.assertEquals("no change set should be sent to the API", 0, client.createCalls);
++	}
++
++	@Test
++	public void createChangeSetForNewStackSendsSuppliedTemplate() throws Exception {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		Collection<Parameter> params = Collections.emptyList();
++		Collection<Tag> tags = Collections.emptyList();
++
++		stack.createChangeSet("cs", "{\"Resources\":{}}", null, params, tags, 0L, ChangeSetType.CREATE, null);
++
++		Assert.assertEquals("a create-type change set must be sent to the API", 1, client.createCalls);
++		Assert.assertNotNull(client.lastCreateChangeSetRequest);
++		Assert.assertEquals(ChangeSetType.CREATE.toString(), client.lastCreateChangeSetRequest.getChangeSetType());
++		Assert.assertEquals("{\"Resources\":{}}", client.lastCreateChangeSetRequest.getTemplateBody());
++	}
++
++	@Test
++	public void createChangeSetForExistingStackReusesPreviousTemplateWhenOmitted() throws Exception {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		Collection<Parameter> params = Collections.emptyList();
++		Collection<Tag> tags = Collections.emptyList();
++
++		stack.createChangeSet("cs", null, null, params, tags, 0L, ChangeSetType.UPDATE, null);
++
++		Assert.assertEquals("an update-type change set must be sent to the API even without a template", 1, client.createCalls);
++		Assert.assertNotNull(client.lastCreateChangeSetRequest);
++		Assert.assertEquals(ChangeSetType.UPDATE.toString(), client.lastCreateChangeSetRequest.getChangeSetType());
++		Assert.assertTrue("omitting both file and url for an existing stack must reuse the previous template",
++				Boolean.TRUE.equals(client.lastCreateChangeSetRequest.getUsePreviousTemplate()));
++	}
++
++	@Test
++	public void executeChangeSetExecutesWhenChangesExist() throws Exception {
++		RecordingCfnClient client = new RecordingCfnClient(true);
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		stack.executeChangeSet("change-set", 0L);
++
++		Assert.assertEquals(1, client.executeCalls);
++		Assert.assertEquals(0, client.deleteCalls);
++	}
++
++	@Test
++	public void executeChangeSetWithZeroPollIntervalDoesNotPollForEvents() throws Exception {
++		RecordingCfnClient client = new RecordingCfnClient(true);
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		stack.executeChangeSet("change-set", 0L);
++
++		Assert.assertEquals(1, client.executeCalls);
++		Assert.assertEquals("pollInterval=0 must suppress event polling while waiting",
++				0, client.describeStackEventsCalls);
++	}
++
++	@Test
++	public void createChangeSetDescriptorMetadata() {
++		CFNCreateChangeSetStep.DescriptorImpl d =
++				new CFNCreateChangeSetStep.DescriptorImpl();
++
++		Assert.assertEquals("cfnCreateChangeSet", d.getFunctionName());
++		Assert.assertNotNull("descriptor must provide a display name", d.getDisplayName());
++		Assert.assertFalse("display name must not be blank", d.getDisplayName().trim().isEmpty());
++	}
++
++	@Test
++	public void executeChangeSetDescriptorMetadata() {
++		CFNExecuteChangeSetStep.DescriptorImpl d =
++				new CFNExecuteChangeSetStep.DescriptorImpl();
++
++		Assert.assertEquals("cfnExecuteChangeSet", d.getFunctionName());
++		Assert.assertNotNull("descriptor must provide a display name", d.getDisplayName());
++		Assert.assertFalse("display name must not be blank", d.getDisplayName().trim().isEmpty());
++	}
++
++	@Test
++	public void existingStackIsDetected() {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		client.stackExists = true;
++
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		Assert.assertTrue(stack.exists());
++	}
++
++	@Test
++	public void missingStackIsNotDetected() {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		client.stackExists = false;
++
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		Assert.assertFalse(stack.exists());
++	}
++
++	@Test
++	public void describeOutputsReturnsStackOutputs() {
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		client.stackExists = true;
++
++		CloudFormationStack stack = new CloudFormationStack(client, "my-stack", TaskListener.NULL);
++
++		Map<String, String> outputs = stack.describeOutputs();
++
++		Assert.assertEquals("value", outputs.get("key"));
++		Assert.assertEquals(1, outputs.size());
++	}
++
++	/**
++	 * cfnUpdate predates this change set support and is refactored to share
++	 * its defaults/validation with the new steps via {@code AbstractCFNCreateStep}.
++	 * This guards that the refactor did not change cfnUpdate's own
++	 * already-public contract (poll interval, create, roleArn).
++	 */
++	@Test
++	public void cfnUpdateStepKeepsItsPublicDefaultsAfterSharingTheAbstractBase() {
++		CFNUpdateStep step = new CFNUpdateStep("my-stack");
++
++		Assert.assertEquals(Long.valueOf(1000L), step.getPollInterval());
++		Assert.assertEquals(Boolean.TRUE, step.getCreate());
++		Assert.assertNull(step.getRoleArn());
++
++		step.setPollInterval(5000L);
++		step.setCreate(false);
++		step.setRoleArn("arn:aws:iam::123456789012:role/S3Access");
++
++		Assert.assertEquals(Long.valueOf(5000L), step.getPollInterval());
++		Assert.assertEquals(Boolean.FALSE, step.getCreate());
++		Assert.assertEquals("arn:aws:iam::123456789012:role/S3Access", step.getRoleArn());
++	}
++
++	/**
++	 * The creation flow (shared by cfnUpdate and cfnCreateChangeSet) must
++	 * reject an unsupported parameter-file extension before any AWS request
++	 * is made. This is exercised through cfnUpdate's own pre-existing
++	 * {@code Execution} class -- not the new step classes -- since the
++	 * validation is shared and cfnUpdate's Execution/step/workspace fields
++	 * predate this change.
++	 */
++	@Test
++	public void parameterFileValidationRejectsUnsupportedExtensionBeforeAnyAwsCall() throws Exception {
++		CFNUpdateStep step = new CFNUpdateStep("my-stack");
++		step.setParamsFile("params.txt");
++
++		CFNUpdateStep.Execution execution = new CFNUpdateStep.Execution();
++		setPrivateField(execution, "step", step);
++
++		try {
++			execution.start();
++			Assert.fail("an unsupported parameter-file extension must fail before any AWS call is attempted");
++		} catch (RuntimeException expected) {
++			// expected: no Thread starting AWS work is reached for an invalid extension
++		}
++	}
++
++	@Test
++	public void parameterFileValidationAcceptsJsonAndYamlExtensionsWithoutThrowing() throws Exception {
++		FilePath testResources = new FilePath(new File("src/test/resources"));
++
++		CFNUpdateStep jsonStep = new CFNUpdateStep("my-stack");
++		jsonStep.setParamsFile("params.json");
++		jsonStep.setCreate(false);
++		CFNUpdateStep.Execution jsonExecution = new CFNUpdateStep.Execution();
++		setPrivateField(jsonExecution, "step", jsonStep);
++		setPrivateField(jsonExecution, "workspace", testResources);
++		Assert.assertFalse("a supported parameter-file extension must not fail synchronously",
++				jsonExecution.start());
++
++		CFNUpdateStep yamlStep = new CFNUpdateStep("my-stack");
++		yamlStep.setParamsFile("params.yaml");
++		yamlStep.setCreate(false);
++		CFNUpdateStep.Execution yamlExecution = new CFNUpdateStep.Execution();
++		setPrivateField(yamlExecution, "step", yamlStep);
++		setPrivateField(yamlExecution, "workspace", testResources);
++		Assert.assertFalse("a supported parameter-file extension must not fail synchronously",
++				 yamlExecution.start());
++	}
++
++	@Test
++	public void createChangeSetExecutionDispatchesExistingStackUpdate() throws Exception {
++		CFNCreateChangeSetStep step = new CFNCreateChangeSetStep("cs", "stack");
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		CloudFormationStack stack = new CloudFormationStack(client, "stack", TaskListener.NULL);
++		CFNCreateChangeSetStep.Execution execution = new CFNCreateChangeSetStep.Execution() {
++			@Override
++			protected CloudFormationStack getCfnStack() {
++				return stack;
++			}
++		};
++		setPrivateField(execution, "step", step);
++
++		execution.whenStackExists(Collections.<Parameter>emptyList(), Collections.<Tag>emptyList());
++
++		Assert.assertEquals("the create execution must dispatch an update change set for an existing stack", 1, client.createCalls);
++		Assert.assertEquals(ChangeSetType.UPDATE.toString(), client.lastCreateChangeSetRequest.getChangeSetType());
++	}
++
++	@Test
++	public void createChangeSetExecutionDispatchesMissingStackCreate() throws Exception {
++		CFNCreateChangeSetStep step = new CFNCreateChangeSetStep("cs", "stack");
++		RecordingCfnClient client = new RecordingCfnClient(false);
++		CloudFormationStack stack = new CloudFormationStack(client, "stack", TaskListener.NULL);
++		CFNCreateChangeSetStep.Execution execution = new CFNCreateChangeSetStep.Execution() {
++			@Override
++			protected CloudFormationStack getCfnStack() {
++				return stack;
++			}
++		};
++		setPrivateField(execution, "step", step);
++
++		execution.whenStackMissing(Collections.<Parameter>emptyList(), Collections.<Tag>emptyList());
++
++		Assert.assertEquals("the create execution must dispatch a create change set for a missing stack", 1, client.createCalls);
++		Assert.assertEquals(ChangeSetType.CREATE.toString(), client.lastCreateChangeSetRequest.getChangeSetType());
++	}
++
++	@Test
++	public void executeChangeSetExecutionValidatesItsPublicInputs() throws Exception {
++		CFNExecuteChangeSetStep step = new CFNExecuteChangeSetStep(null, "stack");
++		CFNExecuteChangeSetStep.Execution execution = new CFNExecuteChangeSetStep.Execution();
++		setPrivateField(execution, "step", step);
++
++		try {
++			execution.start();
++			Assert.fail("a missing change-set name must be rejected before AWS work");
++		} catch (IllegalArgumentException expected) {
++			// expected
++		}
++	}
++
++	private static void setPrivateField(Object target, String fieldName, Object value) throws Exception {
++		Class<?> type = target.getClass();
++		Field field = null;
++		do {
++			try {
++				field = type.getDeclaredField(fieldName);
++				break;
++			} catch (NoSuchFieldException e) {
++				type = type.getSuperclass();
++			}
++		} while (type != null);
++		if (type == null) {
++			throw new NoSuchFieldException(fieldName);
++		}
++		field.setAccessible(true);
++		field.set(target, value);
++	}
++
++	/**
++	 * Minimal stand-in for the AWS client that records the calls made by
++	 * {@link CloudFormationStack} without touching the network. Stubbed
++	 * responses report a terminal status so that the AWS SDK waiters used by
++	 * {@link CloudFormationStack} resolve immediately and deterministically
++	 * instead of polling.
++	 */
++	private static class RecordingCfnClient extends AmazonCloudFormationClient {
++
++		private final boolean hasChanges;
++		boolean stackExists;
++		int describeCalls = 0;
++		int deleteCalls = 0;
++		int executeCalls = 0;
++		int createCalls = 0;
++		int describeStackEventsCalls = 0;
++		CreateChangeSetRequest lastCreateChangeSetRequest;
++
++		RecordingCfnClient(boolean hasChanges) {
++			this.hasChanges = hasChanges;
++		}
++
++		@Override
++		public DescribeStacksResult describeStacks(DescribeStacksRequest request) {
++			if (!this.stackExists) {
++				throw new AmazonCloudFormationException("Stack does not exist");
++			}
++
++			Stack stack = new Stack()
++					.withStackStatus("UPDATE_COMPLETE")
++					.withOutputs(new Output()
++							.withOutputKey("key")
++							.withOutputValue("value"));
++
++			return new DescribeStacksResult().withStacks(stack);
++		}
++
++		@Override
++		public DescribeStackEventsResult describeStackEvents(DescribeStackEventsRequest request) {
++			this.describeStackEventsCalls++;
++			return new DescribeStackEventsResult().withStackEvents(new ArrayList<StackEvent>());
++		}
++
++		@Override
++		public DescribeChangeSetResult describeChangeSet(DescribeChangeSetRequest request) {
++			this.describeCalls++;
++			DescribeChangeSetResult result = new DescribeChangeSetResult().withStatus("CREATE_COMPLETE").withChangeSetType(ChangeSetType.UPDATE.toString());
++			if (this.hasChanges) {
++				result.withChanges(new Change());
++			} else {
++				result.withChanges(new ArrayList<Change>());
++			}
++			return result;
++		}
++
++		@Override
++		public DeleteChangeSetResult deleteChangeSet(DeleteChangeSetRequest request) {
++			this.deleteCalls++;
++			return new DeleteChangeSetResult();
++		}
++
++		@Override
++		public ExecuteChangeSetResult executeChangeSet(ExecuteChangeSetRequest request) {
++			this.executeCalls++;
++			return new ExecuteChangeSetResult();
++		}
++
++		@Override
++		public CreateChangeSetResult createChangeSet(CreateChangeSetRequest request) {
++			this.createCalls++;
++			this.lastCreateChangeSetRequest = request;
++			return new CreateChangeSetResult();
++		}
++	}
++}
